@@ -1,0 +1,21 @@
+#ifndef _SYSCALL_H_
+#define _SYSCALL_H_
+
+/*
+ * Prototypes for IN-KERNEL entry points for system call implementations.
+ */
+
+#include "thread.h"
+#include "synch.h"
+
+int sys_reboot(int code);
+int sys_write(int fd, const void *buf, size_t nbytes, int* retval);
+int sys_read(int fd, void *buf, size_t buflen, int* retval);
+int sys_fork(struct trapframe *tf, int* retval);
+int sys_getpid(int* retval);
+int sys_execv(char *program, char **args);
+int sys_waitpid(pid_t pid, int *status, int options, int* retval);
+void sys_exit(int exitcode);
+time_t sys_time(time_t *seconds, unsigned long *nanoseconds, int* retval);
+int sys_sbrk(intptr_t size, vaddr_t *retval);
+#endif /* _SYSCALL_H_ */

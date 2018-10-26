@@ -1,0 +1,324 @@
+#include <types.h>
+#include <kern/errno.h>
+#include <lib.h>
+#include <machine/pcb.h>
+#include <machine/spl.h>
+#include <machine/trapframe.h>
+#include <kern/callno.h>
+#include <syscall.h>
+#include <uio.h>
+#include <elf.h>
+#include <addrspace.h>
+#include <curthread.h>
+#include <vnode.h>
+#include <thread.h>
+
+
+/*
+ * System call handler.
+ *
+ * A pointer to the trapframe created during exception entry (in
+ * exception.S) is passed in.
+ *
+ * The calling conventions for syscalls are as follows: Like ordinary
+ * function calls, the first 4 32-bit arguments are passed in the 4
+ * argument registers a0-a3. In addition, the system call number is
+ * passed in the v0 register.
+ *
+ * On successful return, the return value is passed back in the v0
+ * register, like an ordinary function call, and the a3 register is
+ * also set to 0 to indicate success.
+ *
+ * On an error return, the error code is passed back in the v0
+ * register, and the a3 register is set to 1 to indicate failure.
+ * (Userlevel code takes care of storing the error code in errno and
+ * returning the value -1 from the actual userlevel syscall function.
+ * See src/lib/libc/syscalls.S and related files.)
+ *
+ * Upon syscall return the program counter stored in the trapframe
+ * must be incremented by one instruction; otherwise the exception
+ * return code will restart the "syscall" instruction and the system
+ * call will repeat forever.
+ *
+ * Since none of the OS/161 system calls have more than 4 arguments,
+ * there should be no need to fetch additional arguments from the
+ * user-level stack.
+ *
+ * Watch out: if you make system calls that have 64-bit quantities as
+ * arguments, they will get passed in pairs of registers, and not
+ * necessarily in the way you expect. We recommend you don't do it.
+ * (In fact, we recommend you don't use 64-bit quantities at all. See
+ * arch/mips/include/types.h.)
+ */
+
+void
+mips_syscall(struct trapframe *tf)
+{
+	int callno;
+	int32_t retval;
+	int err = 0;
+
+	assert(curspl==0);
+
+	callno = tf->tf_v0;
+
+	/*
+	 * Initialize retval to 0. Many of the system calls don't
+	 * really return a value, just 0 for success and -1 on
+	 * error. Since retval is the value returned on success,
+	 * initialize it to 0 by default; thus it's not necessary to
+	 * deal with it except for calls that return other values, 
+	 * like write.
+	 */
+
+	retval = 0;
+
+	switch (callno) {
+	    case SYS_reboot:
+		err = sys_reboot(tf->tf_a0);
+		break;
+            case SYS_write:
+		err = sys_write(tf->tf_a0, (void *)tf->tf_a1, tf->tf_a2, &retval);
+                break;
+		
+            case SYS_read:
+		err = sys_read(tf->tf_a0, (void *)tf->tf_a1, tf->tf_a2, &retval);
+                break;
+	    /* Add stuff here */
+ 
+	    default:
+		kprintf("Unknown syscall %d\n", callno);
+		err = ENOSYS;
+		break;
+	}
+
+
+	if (err) {
+		/*
+		 * Return the error code. This gets converted at
+		 * userlevel to a return value of -1 and the error
+		 * code in errno.
+		 */
+//            kprintf("error value: %d",err );
+//            kprintf("helloooooo i am here");
+		tf->tf_v0 = err;
+		tf->tf_a3 = 1;      /* signal an error */
+	}
+	else {
+		/* Success. */
+//                kprintf("I am in success________error value: %d________",err );
+		tf->tf_v0 = retval;
+		tf->tf_a3 = 0;      /* signal no error */
+	}
+	
+	/*
+	 * Now, advance the program counter, to avoid restarting
+	 * the syscall over and over again.
+	 */
+	
+	tf->tf_epc += 4;
+
+	/* Make sure the syscall code didn't forget to lower spl */
+	assert(curspl==0);
+}
+
+void
+md_forkentry(struct trapframe *tf)
+{
+	/*
+	 * This function is provided as a reminder. You need to write
+	 * both it and the code that calls it.
+	 *
+	 * Thus, you can trash it and do things another way if you prefer.
+	 */
+
+	(void)tf;
+}
+
+
+int sys_write(int fd, const void *buf, size_t nbytes, int* retval){
+    
+//    if (buf == NULL || buf == (char *)0xbadbeef || buf == (char *)0x0 || buf == (char *)0xdeadbeef){
+//        *retval = -1; //check
+//        return EFAULT;
+//    }
+    if (fd!=1 && fd!=2){
+        *retval = -1; //check
+        return EBADF;
+//        *retval = EBADF;
+//        return -1;
+    }
+    if (buf == NULL || buf == (char *)0xbadbeef || buf == (char *)0x0 || buf == (char *)0xdeadbeef || (buf + nbytes) > (char *)0x80000000){
+        *retval = -1; //check
+        return EFAULT;
+//        *retval = EFAULT;
+//        return -1;
+    }
+    int result;
+    struct vnode *v;
+    struct uio u;
+    
+    char *console = NULL;
+    console = kstrdup("con:");
+    result = vfs_open(console, 1, &v);
+    kfree(console);
+    
+    
+    u.uio_iovec.iov_ubase = (userptr_t)buf; //not 100% sure
+    u.uio_iovec.iov_len = nbytes;
+    u.uio_offset = 0;
+    u.uio_resid = nbytes;
+    u.uio_segflg = UIO_USERSPACE;
+    u.uio_rw = UIO_WRITE;
+    u.uio_space = curthread->t_vmspace;
+    result = VOP_WRITE(v, &u);
+    
+   
+//    return result;
+    if (result){
+        *retval = result;
+        return -1;
+    }
+    else{
+        *retval = nbytes;
+        return 0;
+            
+    }
+
+}
+
+int sys_read(int fd, void *buf, size_t buflen, int* retval){
+    if (fd != 0) { // might swap order later
+        *retval = -1;
+        return EBADF;
+//        *retval = EBADF;
+//        return -1;
+    }
+//    	if (buf == NULL){
+//    		return EFAULT;
+//    	}
+    if (buf == NULL || buf == (char *)0xbadbeef || buf == (char *)0x0 || buf == (char *)0xdeadbeef || (buf + buflen) > (char *)0x80000000){
+        *retval = -1;
+        return EFAULT;
+//       *retval = EFAULT;
+//        return -1;
+    }
+    int result;
+    struct vnode *v;
+    struct uio u;
+    
+    char *console = NULL;
+    console = kstrdup("con:");
+    result = vfs_open(console, 0, &v); //1 or 0
+    kfree(console);
+    
+    
+    
+    u.uio_iovec.iov_kbase = buf; //not 100% sure
+//    u.uio_iovec.iov_ubase = (userptr_t) buf;
+    u.uio_iovec.iov_len = buflen;//done
+    u.uio_offset = 0;//done
+    u.uio_resid = buflen;//done
+    u.uio_segflg = UIO_SYSSPACE;//done
+    u.uio_rw = UIO_READ; //done
+    u.uio_space = NULL; //DONE check for other later
+    result = VOP_READ(v, &u);//done
+    
+    
+    if (result){
+        *retval = result;
+        return -1;
+    }
+    else{
+        *retval = buflen;
+        return 0;
+            
+    }
+    
+    
+}
+
+//
+//int
+//sys_write(int fd, const void *buf, size_t nbytes, int *retval) {
+////	int spl = splhigh();
+//	
+//	//kprintf("fd is %d", fd);
+//        if (buf == NULL || buf == (char *)0x0 || buf == (char *)0xdeadbeef || buf == (char *)0xbadbeef){
+//            *retval = -1;    
+////            splx(spl);
+//		return EFAULT;
+//	}
+//        
+//    
+//	if (fd != 1) {
+//		*retval = -1;
+////		splx(spl);
+//		return EBADF;
+//	}
+//	
+//
+////	char* kbuffer = kmalloc(sizeof(char)*(nbytes + 1));
+////	int f = copyin(buf, kbuffer, nbytes);
+////	
+////	if (f == EFAULT || f!=0) {
+////		kfree(kbuffer);
+////		splx(spl);
+////		return EFAULT;
+////	}
+////	
+////	kbuffer[nbytes] = '\0';
+//	
+//	unsigned int i;
+//	for (i = 0; i < nbytes; i++) {
+////		putch(kbuffer[i]);
+//            putch(((char *)buf)[i]);
+////            putch((char *)buf)[i];
+//	}
+//	*retval = nbytes;
+////	kfree(kbuffer);
+////	splx(spl);
+//	
+//	return 0;
+//}
+//
+//int
+//sys_read(int fd, void *buf, size_t buflen, int* retval){
+//	
+//	//int spl = splhigh();
+//	
+//	if (fd != 0) {
+//		//*retval = -1;
+//		return EBADF;
+//	}
+//	if (buf == NULL||buf == (char *)0xbadbeef || buf == (char *)0x0 || buf == (char *)0xdeadbeef){
+//		return EFAULT;
+//	}	
+//
+//	char* kbuffer = kmalloc(sizeof(char)*(buflen + 1));
+//	
+//	unsigned int j;
+//	for (j=0; j<buflen; j++)
+//	{
+//		kbuffer[j] = getch();
+//	}
+//	
+//	int f = copyout(kbuffer, buf, buflen);
+//	
+//	if (f == EFAULT) {
+//		kfree(kbuffer);
+//		return EFAULT;
+//	}
+//	
+//	kfree(kbuffer);
+//	//splx(spl);
+//	
+////	return buflen;
+//        return 0; // apparently should always return 0
+//	
+//}
+//
+
+
+
+

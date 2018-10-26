@@ -1,0 +1,1204 @@
+#include <types.h>
+#include <kern/errno.h>
+#include <lib.h>
+#include <machine/pcb.h>
+#include <machine/spl.h>
+#include <machine/trapframe.h>
+#include <kern/callno.h>
+#include <syscall.h>
+#include <uio.h>
+#include <elf.h>
+#include <addrspace.h>
+#include <curthread.h>
+#include <vnode.h>
+#include <thread.h>
+#include <kern/unistd.h>
+#include <vfs.h>
+//#include <limits.h>
+#define PATH_MAX   1024
+
+
+/*
+ * System call handler.
+ *
+ * A pointer to the trapframe created during exception entry (in
+ * exception.S) is passed in.
+ *
+ * The calling conventions for syscalls are as follows: Like ordinary
+ * function calls, the first 4 32-bit arguments are passed in the 4
+ * argument registers a0-a3. In addition, the system call number is
+ * passed in the v0 register.
+ *
+ * On successful return, the return value is passed back in the v0
+ * register, like an ordinary function call, and the a3 register is
+ * also set to 0 to indicate success.
+ *
+ * On an error return, the error code is passed back in the v0
+ * register, and the a3 register is set to 1 to indicate failure.
+ * (Userlevel code takes care of storing the error code in errno and
+ * returning the value -1 from the actual userlevel syscall function.
+ * See src/lib/libc/syscalls.S and related files.)
+ *
+ * Upon syscall return the program counter stored in the trapframe
+ * must be incremented by one instruction; otherwise the exception
+ * return code will restart the "syscall" instruction and the system
+ * call will repeat forever.
+ *
+ * Since none of the OS/161 system calls have more than 4 arguments,
+ * there should be no need to fetch additional arguments from the
+ * user-level stack.
+ *
+ * Watch out: if you make system calls that have 64-bit quantities as
+ * arguments, they will get passed in pairs of registers, and not
+ * necessarily in the way you expect. We recommend you don't do it.
+ * (In fact, we recommend you don't use 64-bit quantities at all. See
+ * arch/mips/include/types.h.)
+ */
+
+//extern int numthreads;
+//int numthreads;
+int num_of_forks_taken_place = 0;
+void
+mips_syscall(struct trapframe *tf)
+{
+	int callno;
+	int32_t retval;
+	int err = 0;
+
+	assert(curspl==0);
+
+	callno = tf->tf_v0;
+
+	/*
+	 * Initialize retval to 0. Many of the system calls don't
+	 * really return a value, just 0 for success and -1 on
+	 * error. Since retval is the value returned on success,
+	 * initialize it to 0 by default; thus it's not necessary to
+	 * deal with it except for calls that return other values, 
+	 * like write.
+	 */
+
+	retval = 0;
+
+	switch (callno) {
+	    case SYS_reboot:
+		err = sys_reboot(tf->tf_a0);
+		break;
+            case SYS_write:
+		err = sys_write(tf->tf_a0, (void *)tf->tf_a1, tf->tf_a2, &retval);
+                break;
+		
+            case SYS_read:
+		err = sys_read(tf->tf_a0, (void *)tf->tf_a1, tf->tf_a2, &retval);
+                break;
+                
+            case SYS_execv:
+                err = sys_execv((char *)tf->tf_a0, (char **) tf->tf_a1);//to check
+                break;
+	    /* Add stuff here */
+                
+            case SYS_waitpid:
+		err = sys_waitpid((pid_t) tf->tf_a0, (int*) tf-> tf_a1, tf->tf_a2, &retval);
+		break;
+
+            case SYS__exit:
+		sys_exit(tf->tf_a0);
+                break;    
+            
+            case SYS_fork:
+                err = sys_fork(tf, &retval);
+                break;
+                
+            case SYS_getpid:
+                err = sys_getpid(&retval);
+                break;
+ 
+	    default:
+		kprintf("Unknown syscall %d\n", callno);
+		err = ENOSYS;
+		break;
+	}
+
+
+	if (err) {
+		/*
+		 * Return the error code. This gets converted at
+		 * userlevel to a return value of -1 and the error
+		 * code in errno.
+		 */
+//            kprintf("error value: %d",err );
+//            kprintf("helloooooo i am here");
+		tf->tf_v0 = err;
+		tf->tf_a3 = 1;      /* signal an error */
+	}
+	else {
+		/* Success. */
+//                kprintf("I am in success________error value: %d________",err );
+		tf->tf_v0 = retval;
+		tf->tf_a3 = 0;      /* signal no error */
+	}
+	
+	/*
+	 * Now, advance the program counter, to avoid restarting
+	 * the syscall over and over again.
+	 */
+	
+	tf->tf_epc += 4;
+
+	/* Make sure the syscall code didn't forget to lower spl */
+	assert(curspl==0);
+}
+
+int
+sys_getpid(int* retval){
+    *retval = curthread->pid;
+    return 0;
+}
+
+
+
+void
+md_forkentry(struct trapframe *tf, unsigned long child_address)//doneeeeeee
+{
+	/*
+	 * This function is provided as a reminder. You need to write
+	 * both it and the code that calls it.
+	 *
+	 * Thus, you can trash it and do things another way if you prefer.
+	 */
+
+	(void)tf;
+    
+    struct trapframe* local = tf;
+    struct addrspace* nas = (struct addrspace*) child_address;
+
+
+    local->tf_v0 = 0;
+    local->tf_a3 = 0;
+    local->tf_epc += 4;
+    
+    curthread->t_vmspace = nas;
+	as_activate(nas);
+	
+
+    //kprintf("HELLO DARKENSS md_forkentry \n");
+	struct trapframe tfnew = *local;
+	kfree(tf);
+    tf = NULL;
+        mips_usermode(&tfnew);
+
+    
+        
+//        struct trapframe* intermediate_tf = tf; // used for passing into usermode without losing memory
+//        struct addrspace* intermediate_address = (struct addrspace*) child_address; //check for flipping!!!!!
+//        
+//        //set up return value, error value and PC incrementation to next process
+//	intermediate_tf->tf_v0 = 0;
+//	intermediate_tf->tf_a3 = 0;
+//	intermediate_tf->tf_epc += 4;
+//        
+//        
+//        curthread->t_vmspace = intermediate_address;//activate this new address
+//        as_activate(intermediate_address);
+//        
+//        //make a temporary tf for passing into usermode
+//        struct trapframe passing_tf = *intermediate_tf;
+//        kfree(tf);
+//        tf = NULL;
+//        mips_usermode(&passing_tf);
+
+}
+
+int sys_fork(struct trapframe *tf, int* retval ){
+    int error_checking = 0;
+    int error_checking2 = 0;
+    int process_ppid = curthread->ppid;
+    struct addrspace *newly_assigned_address;
+    struct thread *child_thread;
+//    kprintf("number of threads %d", numthreads);
+//    if (numthreads > 64)
+////        *retval
+//        *retval = EAGAIN;
+//        return EAGAIN;
+    
+    if (num_of_forks_taken_place > 100){
+        *retval = EAGAIN;
+        return EAGAIN;
+    }
+    else{
+        num_of_forks_taken_place ++;
+    }
+//        *retval
+    
+    struct trapframe *new_tf = (struct trapframe*) kmalloc(sizeof(struct trapframe));
+    if(new_tf == NULL){
+        
+        *retval = ENOMEM;
+        return ENOMEM; //can return -1
+    }
+    
+    error_checking2 = as_copy(curthread->t_vmspace, &newly_assigned_address);
+    
+    if (error_checking2!=0){
+//        *retval = -1;
+//        return error_checking2;
+        *retval = error_checking2;
+        return -1;
+    }
+    
+        
+    as_activate(curthread->t_vmspace);
+    
+    *new_tf = *tf;
+    
+    error_checking = thread_fork(curthread->t_name, (struct trapframe*) new_tf, (unsigned long) newly_assigned_address, md_forkentry, &child_thread);
+    //to do: need to update the list and information and check for result if valid
+    // to do: modify the mdforkentry function for incrementation
+    
+    if (error_checking != 0){
+        *retval = error_checking;
+        return -1;
+    }
+//    if (error_checking!=0){
+//        *retval = -1;
+//        return error_checking;
+    *retval = child_thread->pid;
+    process_table[child_thread->pid].ppid = process_ppid;
+    child_thread->ppid = process_table[child_thread->pid].ppid;
+    
+    
+    //need to include else statement: also, update the process table
+//    *retval = 
+            
+    return 0;
+    
+}
+
+int 
+sys_waitpid(pid_t pid, int *status, int options, int* retval){
+    //kprintf("I am in waitpid for %d \n", pid);
+    
+        
+         if(status == NULL){ 
+            // kprintf("error 7\n");
+            return EFAULT;
+        }
+        if (pid < 0)
+            return EINVAL;
+        
+        if (pid == 0)
+        {
+            *status = 0;
+            return EINVAL;
+        }
+        if(pid >= 149){
+            return EINVAL;
+        }
+        if(options){
+		 return EINVAL;
+	}
+        
+	if(status == NULL){
+      //   kprintf("error 8\n");
+		return EFAULT;
+	}
+        
+        int* errorCheck = kmalloc(sizeof(int));
+        int error = copyin(status, errorCheck, sizeof(int));
+//        kprintf("i am here lolololols lit:    %d     ", error);
+
+        if (error != 0){
+//            kprintf("i am here lolololols lit:    %d     ", error);
+            kfree(errorCheck);
+            errorCheck = NULL;
+            *retval = -1;
+            return error;
+        }
+        
+//        if(process_table[pid].ppid!=curthread->pid){
+//            return EINVAL;
+//        }
+
+//	if ((int) pid == int(curthread-> ppid)) //if you're waiting for your parent, nono okay
+//  	    return EINVAL; 	
+//        if ((int) pid == int(curthread-> pid))  //if you're waiting for yourself, nono
+//            return EINVAL;
+        if ((int)pid == curthread -> pid)  //if you're waiting for yourself, nono
+            return EINVAL;
+        if ((int)pid == curthread -> ppid) //if you're waiting for your parent, nono okay
+  	    return EINVAL; 	
+//        if (pid == curthread -> pid)  //if you're waiting for yourself, nono
+//            return EINVAL;
+        if ((int) status % 4 != 0)
+            return EINVAL;
+        
+        
+        if (process_table[pid].assigned == 0 && process_table[pid].thread_ptr == NULL)
+            return EINVAL;
+        
+//        if (pid == curthread->ppid)
+
+//        if (process_table[pid].wait == 1){
+////            kprintf("i am here: %d", pid);
+//            return EINVAL;
+//        }
+        if (process_table[pid].being_waited_upon == 1){//////////////////////////////////////////check waited on
+//            kprintf("i am here: %d", pid);
+            return EINVAL;
+        }
+// if the process already exited         
+        if (process_table[pid].exited == 0){
+            *retval = pid;
+            *status = process_table[pid].exitcode;
+            return 0;
+        }
+
+//        if (process_table[pid].exited == 0 && process_table[pid].ppid == curthread->pid){
+//            *retval = pid;
+//            *status = process_table[pid].exitcode;
+//            return 0;
+//        }
+//        if (process_table[pid].exited == 0 && process_table[pid].ppid != curthread->pid){
+//            *retval = pid;
+//            *status = process_table[pid].exitcode;
+//            return 0;
+//        }
+        
+        
+///error is here in cv_wait
+// if not then acquire the lock and put it in wait under the process.pid it is calling
+        *retval = pid;
+        P(process_table[pid].waitpid_exit_sem);
+//        lock_acquire(process_table[pid].exit_lock);
+//                                    ////////good parent will only pick up their own child
+//        cv_wait(process_table[pid].good_parent_cv, process_table[pid].exit_lock);//////////
+//        lock_release(process_table[pid].exit_lock); 
+        *status = process_table[pid].exitcode;
+        *retval = pid;
+//        kprintf("\n     i am here: %d       \n", pid);
+        process_table[pid].being_waited_upon = 1;
+        kfree(errorCheck);
+        errorCheck = NULL;
+        return 0;
+}
+
+void 
+sys_exit(int exitcode){
+       
+// acquire the lock and release everything that's sleeping under the parent = current thread
+
+    //add V
+//    lock_acquire(process_table[curthread->pid].exit_lock);
+//    //kprintf ("passed this - 1\n");
+//    cv_broadcast(process_table[curthread->pid].good_parent_cv, process_table[curthread->pid].exit_lock);
+//    //kprintf ("passed this - 2\n");
+//    
+//    lock_release(process_table[curthread->pid].exit_lock);
+//    //kprintf ("passed this - 3\n");s
+    V(process_table[curthread->pid].waitpid_exit_sem);
+    process_table[curthread->pid].exited = 0;
+    process_table[curthread->pid].exitcode = exitcode;
+//    process_table[curthread->pid].thread_ptr = NULL;
+//    numthreads --;
+    
+    //kprintf("Going into thread exit \n");
+    thread_exit(); 
+
+}
+//fix this
+
+int sys_execv(char *program, char **args){
+	struct vnode *v;
+	vaddr_t entryptr, stackptr;
+//	int error, spl;
+        int error;
+	int argCount = 0;	
+	int i = 0;
+	int result;
+	size_t buffer;
+
+	//Error checks
+
+	//Check if 2 arguments are null, if null return EFAULT splx(spl); (turn interupt back
+	if (program == NULL || args == NULL) {
+		return EFAULT;
+	}
+
+        
+//	if (args == NULL) {
+//		return EFAULT;
+//	}
+
+	//turn off interrupts
+//	spl = splhigh(); 
+    
+	//Copy program name from user space to kernel space
+	//Memory address needs to be reserved
+	char* nameOfProgram = (char*)kmalloc(PATH_MAX); 
+	//error check for every malloc
+	//check if memory allocation was successful (not checked by autotester, but good to have)
+	if (nameOfProgram == NULL) {
+//		splx(spl); //turn interrupt back on
+		return ENOMEM;	
+	}	
+
+	error = copyinstr((userptr_t)program,nameOfProgram,PATH_MAX,&buffer);
+	if (error) {
+//		splx(spl);
+		kfree(nameOfProgram);
+		return error;
+	}
+
+        if (strlen(nameOfProgram) == 0) {
+            kfree(nameOfProgram);
+            return EINVAL;
+        }
+        
+//	if (buffer == 1) {
+////		splx(spl);
+//		kfree(nameOfProgram);
+//		return EINVAL;
+//	}
+
+	char** dummyArgCopy;
+	dummyArgCopy = (char **)kmalloc (sizeof(char*));	
+	error = copyin((userptr_t)args,dummyArgCopy,(sizeof(char*)));
+	if (error){
+//		splx(spl);
+		kfree(nameOfProgram);
+		return error;
+	} 
+
+	kfree(dummyArgCopy);
+	
+	//don't use user pointer in kernal space therefore create a dummy variable
+	//count how many arguments have been received to know how much memory to reserve and check last argument is NULL 
+	char* dummyChar;
+	i = 0;
+	while(1) {
+		error = copyin((userptr_t)&(args[i]), &dummyChar, (sizeof(userptr_t)));
+		if (error) {
+		//always want to check if the copy failed or not, returns 0 if it works 
+		//should probably free any kmallocs before returning
+//			splx(spl);
+			return EFAULT;
+		}
+		
+		if (dummyChar == NULL) break;
+
+		i++;		
+	}
+	argCount = i;
+
+	char** argCopy;
+	argCopy = (char **)kmalloc (sizeof(char*)*(argCount+1));
+
+	//check thing
+	if( argCopy == NULL) {
+//		splx(spl);
+		return ENOMEM;
+	}
+
+	//Copy user arguments from user space to kernel space
+	//Make sure last index of arguments array contain NULL
+	//int i;
+//	for (i = 0; i < argCount; i++) {
+//		argCopy[i] = (char*)kmalloc(sizeof(char) * PATH_MAX);
+//		error = copyinstr((userptr_t)args[i], argCopy[i], PATH_MAX, &buffer);
+//		//error = copyin((userptr_t)&(args[i]), argCopy[i], strlen(argCopy[i]+1));
+//		if (error) {
+//			splx(spl);
+//			return error;
+//		}
+//	}
+        i = 0;
+        while (i<argCount){
+		argCopy[i] = (char*)kmalloc(sizeof(char) * PATH_MAX);
+		error = copyinstr((userptr_t)args[i], argCopy[i], PATH_MAX, &buffer);
+		//error = copyin((userptr_t)&(args[i]), argCopy[i], strlen(argCopy[i]+1));
+		if (error) {
+//			splx(spl);
+			return error;
+		}
+                i++;
+	}
+        
+	argCopy[argCount] = NULL;
+
+	result = vfs_open(nameOfProgram, O_RDONLY, &v);
+	if (result) {
+		return result;
+	}
+	
+	if (curthread->t_vmspace != NULL) {
+		struct addrspace *toDelete;
+		toDelete = curthread->t_vmspace;
+		curthread->t_vmspace = NULL;
+		as_destroy(toDelete);		
+	}
+	/*if (curthread->t_vmspace)
+		curthread->t_vmspace = NULL;*/
+
+	/* We should be a new thread. */
+	assert(curthread->t_vmspace == NULL);
+
+	/* Create a new address space. */
+	curthread->t_vmspace = as_create();
+	if (curthread->t_vmspace==NULL) {
+		vfs_close(v);
+		return ENOMEM;
+	}
+
+	/* Activate it. */
+	as_activate(curthread->t_vmspace);
+
+	/* Load the executable. */
+	result = load_elf(v, &entryptr);
+	if (result) {
+		/* thread_exit destroys curthread->t_vmspace */
+		vfs_close(v);
+		return result;
+	}
+
+	/* Done with the file now. */
+	vfs_close(v);
+
+	/* Define the user stack in the address space */
+	result = as_define_stack(curthread->t_vmspace, &stackptr);
+	if (result) {
+		/* thread_exit destroys curthread->t_vmspace */
+		return result;
+	}
+	
+	//push strings in argument array onto stack
+	int argLength = 0;
+	int spOffset = 0;
+	vaddr_t argptr[argCount+1];
+        
+        
+//	for (i = argCount-1; i >= 0; i--) {		
+//		argLength = strlen(argCopy[i]) + 1;
+//		spOffset = (argLength + 3)/4;
+//		stackptr -= spOffset*4;
+//		error = copyoutstr(argCopy[i], (userptr_t)stackptr, argLength, &buffer);
+//		if (error) {
+//			splx(spl);
+//			return error;
+//		}
+//		argptr[i] = stackptr;
+//	}
+        i = argCount - 1;
+        int total_size = 0;
+        while(i >= 0){	
+            argLength = strlen(argCopy[i]) + 1;
+//            stackptr -= argLength;////////////
+            spOffset = (argLength + 3)/4;
+            stackptr -= spOffset*4;
+            error = copyoutstr(argCopy[i], (userptr_t)stackptr, argLength, &buffer);
+            if (error) {
+//                    splx(spl);
+                    return error;
+            }
+            argptr[i] = stackptr;
+            i = i - 1;
+            total_size += argLength;
+            if (total_size > PATH_MAX)
+                return E2BIG;
+	}
+	argptr[argCount] = NULL;
+
+	//push argument pointers onto stack including NULL
+        i = argCount;
+        while(i >= 0){
+            stackptr -= sizeof(void*);
+            error = copyout(&argptr[i], (userptr_t)stackptr, sizeof(argptr[i]));
+            if (error) {
+//                    splx(spl);
+                    return error;
+            }
+            i = i - 1;
+	}
+//        stackptr-=stackptr%4;///////////
+//	for (i = argCount; i >= 0; i--) {
+//		stackptr -= sizeof(void*);
+//		error = copyout(&argptr[i], (userptr_t)stackptr, sizeof(argptr[i]));
+//		if (error) {
+//			splx(spl);
+//			return error;
+//		}
+//	}
+
+//	splx(spl);
+
+	/* Warp to user mode. */
+	md_usermode(argCount, (userptr_t)stackptr, stackptr, entryptr);
+	
+	/* md_usermode does not return */
+	panic("md_usermode returned\n");
+	return EINVAL;
+}
+
+//
+//int sys_execv(char *program, char **args){
+//	struct vnode *v;
+//	vaddr_t entryptr, stackptr;
+//	int error, spl;
+//	int argCount = 0;	
+//	int i = 0;
+//	int result;
+//	size_t buffer;
+//
+//	//Error checks
+//
+//	//Check if 2 arguments are null, if null return EFAULT splx(spl); (turn interupt back
+//	if (program == NULL) {
+//		return EFAULT;
+//	}
+//
+//	if (args == NULL) {
+//		return EFAULT;
+//	}
+//
+//	//turn off interrupts
+//	spl = splhigh(); 
+//    
+//	//Copy program name from user space to kernel space
+//	//Memory address needs to be reserved
+//	char* nameOfProgram = (char*)kmalloc(PATH_MAX); 
+//	//error check for every malloc
+//	//check if memory allocation was successful (not checked by autotester, but good to have)
+//	if (nameOfProgram == NULL) {
+//		splx(spl); //turn interrupt back on
+//		return ENOMEM;	
+//	}	
+//
+//	error = copyinstr((userptr_t)program,nameOfProgram,PATH_MAX,&buffer);
+//	if (error) {
+//		splx(spl);
+//		kfree(nameOfProgram);
+//		return error;
+//	}
+//
+//	if (buffer == 1) {
+//		splx(spl);
+//		kfree(nameOfProgram);
+//		return EINVAL;
+//	}
+//
+//	char** dummyArgCopy;
+//	dummyArgCopy = (char **)kmalloc (sizeof(char*));	
+//	error = copyin((userptr_t)args,dummyArgCopy,(sizeof(char*)));
+//	if (error){
+//		splx(spl);
+//		kfree(nameOfProgram);
+//		return error;
+//	} 
+//
+//	kfree(dummyArgCopy);
+//	
+//	//don't use user pointer in kernal space therefore create a dummy variable
+//	//count how many arguments have been received to know how much memory to reserve and check last argument is NULL 
+//	char* dummyChar;
+//	i = 0;
+//	while(1) {
+//		error = copyin((userptr_t)&(args[i]), &dummyChar, (sizeof(userptr_t)));
+//		if (error) {
+//		//always want to check if the copy failed or not, returns 0 if it works 
+//		//should probably free any kmallocs before returning
+//			splx(spl);
+//			return EFAULT;
+//		}
+//		
+//		if (dummyChar == NULL) break;
+//
+//		i++;		
+//	}
+//	argCount = i;
+//
+//	char** argCopy;
+//	argCopy = (char **)kmalloc (sizeof(char*)*(argCount+1));
+//
+//	//check thing
+//	if( argCopy == NULL) {
+//		splx(spl);
+//		return ENOMEM;
+//	}
+//
+//	//Copy user arguments from user space to kernel space
+//	//Make sure last index of arguments array contain NULL
+//	//int i;
+//	for (i = 0; i < argCount; i++) {
+//		argCopy[i] = (char*)kmalloc(sizeof(char) * PATH_MAX);
+//		error = copyinstr((userptr_t)args[i], argCopy[i], PATH_MAX, &buffer);
+//		//error = copyin((userptr_t)&(args[i]), argCopy[i], strlen(argCopy[i]+1));
+//		if (error) {
+//			splx(spl);
+//			return error;
+//		}
+//	}
+//	argCopy[argCount] = NULL;
+//
+//	result = vfs_open(nameOfProgram, O_RDONLY, &v);
+//	if (result) {
+//		return result;
+//	}
+//	
+//	if (curthread->t_vmspace != NULL) {
+//		struct addrspace *toDelete;
+//		toDelete = curthread->t_vmspace;
+//		curthread->t_vmspace = NULL;
+//		as_destroy(toDelete);		
+//	}
+//	/*if (curthread->t_vmspace)
+//		curthread->t_vmspace = NULL;*/
+//
+//	/* We should be a new thread. */
+//	assert(curthread->t_vmspace == NULL);
+//
+//	/* Create a new address space. */
+//	curthread->t_vmspace = as_create();
+//	if (curthread->t_vmspace==NULL) {
+//		vfs_close(v);
+//		return ENOMEM;
+//	}
+//
+//	/* Activate it. */
+//	as_activate(curthread->t_vmspace);
+//
+//	/* Load the executable. */
+//	result = load_elf(v, &entryptr);
+//	if (result) {
+//		/* thread_exit destroys curthread->t_vmspace */
+//		vfs_close(v);
+//		return result;
+//	}
+//
+//	/* Done with the file now. */
+//	vfs_close(v);
+//
+//	/* Define the user stack in the address space */
+//	result = as_define_stack(curthread->t_vmspace, &stackptr);
+//	if (result) {
+//		/* thread_exit destroys curthread->t_vmspace */
+//		return result;
+//	}
+//	
+//	//push strings in argument array onto stack
+//	int argLength = 0;
+//	int spOffset = 0;
+//	vaddr_t argptr[argCount+1];
+//	for (i = argCount-1; i >= 0; i--) {		
+//		argLength = strlen(argCopy[i]) + 1;
+//		spOffset = (argLength + 3)/4;
+//		stackptr -= spOffset*4;
+//		error = copyoutstr(argCopy[i], (userptr_t)stackptr, argLength, &buffer);
+//		if (error) {
+//			splx(spl);
+//			return error;
+//		}
+//		argptr[i] = stackptr;
+//	}
+//
+//	argptr[argCount] = NULL;
+//
+//	//push argument pointers onto stack including NULL
+//	for (i = argCount; i >= 0; i--) {
+//		stackptr -= sizeof(void*);
+//		error = copyout(&argptr[i], (userptr_t)stackptr, sizeof(argptr[i]));
+//		if (error) {
+//			splx(spl);
+//			return error;
+//		}
+//	}
+//
+//	splx(spl);
+//
+//	/* Warp to user mode. */
+//	md_usermode(argCount, (userptr_t)stackptr, stackptr, entryptr);
+//	
+//	/* md_usermode does not return */
+//	panic("md_usermode returned\n");
+//	return EINVAL;
+//}
+
+//int sys_execv(const char *progname, char *const *args)
+//{
+//    
+//    
+//    //to do: error checking at the start
+//    struct vnode *v;
+//    vaddr_t entrypoint, stackptr;
+//    int result;
+//    int error_checking;
+//    size_t size_check_buffer;
+//    size_t buffer;
+//    int number_of_arguments = 0;
+//    
+//    int spl = splhigh();
+//    
+//    char* kernel_space_progname = (char*) kmalloc(PATH_MAX); // create a kernel space name to be copied in later
+//    /* Open the file. */
+//    
+//    
+//    //make sure enough space for the program name
+//    if (kernel_space_progname == NULL){
+//        splx(spl);
+//        return ENOMEM;
+//    }
+//    
+//    
+//    
+//    error_checking = copyinstr((userptr_t)progname, kernel_space_progname, PATH_MAX, &size_check_buffer);
+//    if (error_checking){ // did not work, non-zero value
+//        splx(spl);
+//        kfree(kernel_space_progname);
+//        
+//        return error_checking; //can change to some other value
+//    }
+//    
+//    //////////////////////////////////////////////////////////////////////////////////////////////////
+//    
+//    char** check_if_valid_double_ptr = (char**) kmalloc(sizeof(char*));
+//    error_checking = copyin((userptr_t)args, check_if_valid_double_ptr, (sizeof(char*)));
+//    if (error_checking != 0){
+//        splx(spl);
+//        kfree(check_if_valid_double_ptr);///////might need to turn back on interrupt before kfree!!!!!!!!!!!!!!!!!!!!
+//        
+//        return error_checking;
+//    }
+//    kfree(check_if_valid_double_ptr);
+//    
+//    char* check_if_valid_single_ptr;///////////////////make sure to come back and check if set size
+//    number_of_arguments = 0;//just in case
+//    while(1){//make sure to come back and check
+//        error_checking = copyin((userptr_t)&(args[number_of_arguments]), &check_if_valid_single_ptr, (sizeof(userptr_t)));
+//        kprintf("3");
+//
+//        if (check_if_valid_single_ptr == NULL){
+//            break;
+//        }
+//        number_of_arguments++;
+//
+//    }
+//    if (error_checking){
+//        splx(spl);
+//        return EFAULT;
+//    }
+//    
+//    char** check_if_valid_argument_content = (char**) kmalloc(sizeof(char*) * (number_of_arguments + 1));
+//    
+//    if (check_if_valid_argument_content == NULL){
+//        splx(spl);
+//        return ENOMEM;
+//    }
+//    
+//    int current_argument_position = 0;
+//    
+//    while(current_argument_position < number_of_arguments){
+//        kprintf("2");
+//
+//        check_if_valid_argument_content[current_argument_position] = (char*) kmalloc(sizeof(char) * PATH_MAX);
+//        error_checking = copyinstr((userptr_t)args[current_argument_position], check_if_valid_argument_content[current_argument_position], PATH_MAX, &buffer);
+//        if (error_checking){ //come back to check
+//            splx(spl);
+//            return error_checking;
+//        }
+//        current_argument_position++;
+//    }
+//    
+//    check_if_valid_argument_content[current_argument_position] = NULL;
+//    
+//    
+//    
+//    
+//    
+//    //____????????
+//    
+//    result = vfs_open(progname, O_RDONLY, &v);
+//    if (result) {
+//            return result;
+//    }
+//    
+//    if (curthread->t_vmspace != NULL) {//try taking out later for checking for NULL
+//            struct addrspace *toDelete;
+//            toDelete = curthread->t_vmspace;
+//            curthread->t_vmspace = NULL;//can change order of the last 2
+//            as_destroy(toDelete);		
+//    }
+//    
+//    
+//
+//    /* We should be a new thread. */
+//    assert(curthread->t_vmspace == NULL);
+//
+//    /* Create a new address space. */
+//    curthread->t_vmspace = as_create();
+//    if (curthread->t_vmspace==NULL) {
+//            vfs_close(v);
+//            return ENOMEM;
+//    }
+//
+//    /* Activate it. */
+//    as_activate(curthread->t_vmspace);//activate in the TLB
+//
+//    /* Load the executable. */
+//    result = load_elf(v, &entrypoint); //handle and load into correct memory segment
+//    if (result) {
+//            /* thread_exit destroys curthread->t_vmspace */
+//            vfs_close(v);
+//            return result;
+//    }
+//
+//    /* Done with the file now. */
+//    vfs_close(v);
+//
+//    /* Define the user stack in the address space */
+//    result = as_define_stack(curthread->t_vmspace, &stackptr);//usermode stack
+//    if (result) {
+//            /* thread_exit destroys curthread->t_vmspace */
+//            return result;
+//    }
+//
+//    //implementing pushing onto stack
+//    
+//    int current_argument_length;
+//    int stack_pointer_offset;
+////    vaddr_t argument_pointer;
+//    
+//    stack_pointer_offset = 0;
+//    current_argument_length = 0;
+//    vaddr_t argument_pointer[number_of_arguments + 1];
+////    for (i = 0; i <= number_of_arguments - 1; i++){
+////        
+////        current_argument_length = strlen()
+////        
+////    }
+//    
+//    int incrementer_for_stack = number_of_arguments - 1 ;
+//    while(incrementer_for_stack >= 0){
+//        kprintf("2");
+//        current_argument_length = strlen(check_if_valid_argument_content[incrementer_for_stack]) + 1;
+//        stack_pointer_offset = (3 + current_argument_length); //for space alignment:: very important okay
+//        stack_pointer_offset = stack_pointer_offset/4;
+//        
+//        stackptr = stackptr - stack_pointer_offset * 4;
+//        error_checking = copyoutstr(check_if_valid_argument_content[incrementer_for_stack], (userptr_t)stackptr, current_argument_length, &buffer);
+//        if (error_checking){
+//            splx(spl);
+//            return error_checking;
+//        }
+//        argument_pointer[incrementer_for_stack] = stackptr;
+//        incrementer_for_stack--;
+//    }
+//    
+//    argument_pointer[number_of_arguments] = NULL;
+//    int incrementer_for_stack_pushing = number_of_arguments;
+//    while(incrementer_for_stack_pushing >= 0){
+//        kprintf("1");
+//        stackptr -= sizeof(void*);
+//        error_checking = copyout(&argument_pointer[incrementer_for_stack_pushing], (userptr_t)stackptr, sizeof(argument_pointer[incrementer_for_stack_pushing]));
+//        if (error_checking){
+//            splx(spl);
+//            return error_checking;
+//        }    
+//        incrementer_for_stack_pushing--;
+//        
+//    }
+//
+//    splx(spl);
+//    /* Warp to user mode. */
+//    md_usermode(0 /*argc*/, NULL /*userspace addr of argv*/,
+//                stackptr, entrypoint);
+//
+//    /* md_usermode does not return */
+//    panic("md_usermode returned\n");
+//    return EINVAL;
+//}
+
+
+int sys_write(int fd, const void *buf, size_t nbytes, int* retval){
+    
+//    if (buf == NULL || buf == (char *)0xbadbeef || buf == (char *)0x0 || buf == (char *)0xdeadbeef){
+//        *retval = -1; //check
+//        return EFAULT;
+//    }
+    if (fd!=1 && fd!=2){
+        *retval = -1; //check
+        return EBADF;
+//        *retval = EBADF;
+//        return -1;
+    }
+    if (buf == NULL || buf == (char *)0xbadbeef || buf == (char *)0x0 || buf == (char *)0xdeadbeef || (buf + nbytes) > (char *)0x80000000){
+        *retval = -1; //check
+        return EFAULT;
+//        *retval = EFAULT;
+//        return -1;
+    }
+    int result;
+    struct vnode *v;
+    struct uio u;
+    
+    char *console = NULL;
+    console = kstrdup("con:");
+    result = vfs_open(console, 1, &v);
+    kfree(console);
+    
+    
+    u.uio_iovec.iov_ubase = (userptr_t)buf; //not 100% sure
+    u.uio_iovec.iov_len = nbytes;
+    u.uio_offset = 0;
+    u.uio_resid = nbytes;
+    u.uio_segflg = UIO_USERSPACE;
+    u.uio_rw = UIO_WRITE;
+    u.uio_space = curthread->t_vmspace;
+    result = VOP_WRITE(v, &u);
+    
+   
+//    return result;
+    if (result){
+        *retval = result;
+        return -1;
+    }
+    else{
+        *retval = nbytes;
+        return 0;
+            
+    }
+
+}
+
+int sys_read(int fd, void *buf, size_t buflen, int* retval){
+    if (fd != 0) { // might swap order later
+        *retval = -1;
+        return EBADF;
+//        *retval = EBADF;
+//        return -1;
+    }
+//    	if (buf == NULL){
+//    		return EFAULT;
+//    	}
+    if (buf == NULL || buf == (char *)0xbadbeef || buf == (char *)0x0 || buf == (char *)0xdeadbeef || (buf + buflen) > (char *)0x80000000){
+        *retval = -1;
+        return EFAULT;
+//       *retval = EFAULT;
+//        return -1;
+    }
+    int result;
+    struct vnode *v;
+    struct uio u;
+    
+    char *console = NULL;
+    console = kstrdup("con:");
+    result = vfs_open(console, 0, &v); //1 or 0
+    kfree(console);
+    
+    
+    
+    u.uio_iovec.iov_kbase = buf; //not 100% sure
+//    u.uio_iovec.iov_ubase = (userptr_t) buf;
+    u.uio_iovec.iov_len = buflen;//done
+    u.uio_offset = 0;//done
+    u.uio_resid = buflen;//done
+    u.uio_segflg = UIO_SYSSPACE;//done
+    u.uio_rw = UIO_READ; //done
+    u.uio_space = NULL; //DONE check for other later
+    result = VOP_READ(v, &u);//done
+    
+    
+    if (result){
+        *retval = result;
+        return -1;
+    }
+    else{
+        *retval = buflen;
+        return 0;
+            
+    }
+    
+    
+}
+
+//
+//int
+//sys_write(int fd, const void *buf, size_t nbytes, int *retval) {
+////	int spl = splhigh();
+//	
+//	//kprintf("fd is %d", fd);
+//        if (buf == NULL || buf == (char *)0x0 || buf == (char *)0xdeadbeef || buf == (char *)0xbadbeef){
+//            *retval = -1;    
+////            splx(spl);
+//		return EFAULT;
+//	}
+//        
+//    
+//	if (fd != 1) {
+//		*retval = -1;
+////		splx(spl);
+//		return EBADF;
+//	}
+//	
+//
+////	char* kbuffer = kmalloc(sizeof(char)*(nbytes + 1));
+////	int f = copyin(buf, kbuffer, nbytes);
+////	
+////	if (f == EFAULT || f!=0) {
+////		kfree(kbuffer);
+////		splx(spl);
+////		return EFAULT;
+////	}
+////	
+////	kbuffer[nbytes] = '\0';
+//	
+//	unsigned int i;
+//	for (i = 0; i < nbytes; i++) {
+////		putch(kbuffer[i]);
+//            putch(((char *)buf)[i]);
+////            putch((char *)buf)[i];
+//	}
+//	*retval = nbytes;
+////	kfree(kbuffer);
+////	splx(spl);
+//	
+//	return 0;
+//}
+//
+//int
+//sys_read(int fd, void *buf, size_t buflen, int* retval){
+//	
+//	//int spl = splhigh();
+//	
+//	if (fd != 0) {
+//		//*retval = -1;
+//		return EBADF;
+//	}
+//	if (buf == NULL||buf == (char *)0xbadbeef || buf == (char *)0x0 || buf == (char *)0xdeadbeef){
+//		return EFAULT;
+//	}	
+//
+//	char* kbuffer = kmalloc(sizeof(char)*(buflen + 1));
+//	
+//	unsigned int j;
+//	for (j=0; j<buflen; j++)
+//	{
+//		kbuffer[j] = getch();
+//	}
+//	
+//	int f = copyout(kbuffer, buf, buflen);
+//	
+//	if (f == EFAULT) {
+//		kfree(kbuffer);
+//		return EFAULT;
+//	}
+//	
+//	kfree(kbuffer);
+//	//splx(spl);
+//	
+////	return buflen;
+//        return 0; // apparently should always return 0
+//	
+//}
+//
+
+
+
+

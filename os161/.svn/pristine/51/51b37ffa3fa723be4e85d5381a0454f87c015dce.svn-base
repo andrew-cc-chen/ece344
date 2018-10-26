@@ -1,0 +1,658 @@
+#include <types.h>
+#include <kern/errno.h>
+#include <lib.h>
+#include <machine/pcb.h>
+#include <machine/spl.h>
+#include <machine/trapframe.h>
+#include <kern/callno.h>
+#include <syscall.h>
+#include <uio.h>
+#include <elf.h>
+#include <addrspace.h>
+#include <curthread.h>
+#include <vnode.h>
+#include <thread.h>
+#include <kern/unistd.h>
+#include <vfs.h>
+#include <clock.h>
+#define PATH_MAX   1024
+
+
+/*
+ * System call handler.
+ *
+ * A pointer to the trapframe created during exception entry (in
+ * exception.S) is passed in.
+ *
+ * The calling conventions for syscalls are as follows: Like ordinary
+ * function calls, the first 4 32-bit arguments are passed in the 4
+ * argument registers a0-a3. In addition, the system call number is
+ * passed in the v0 register.
+ *
+ * On successful return, the return value is passed back in the v0
+ * register, like an ordinary function call, and the a3 register is
+ * also set to 0 to indicate success.
+ *
+ * On an error return, the error code is passed back in the v0
+ * register, and the a3 register is set to 1 to indicate failure.
+ * (Userlevel code takes care of storing the error code in errno and
+ * returning the value -1 from the actual userlevel syscall function.
+ * See src/lib/libc/syscalls.S and related files.)
+ *
+ * Upon syscall return the program counter stored in the trapframe
+ * must be incremented by one instruction; otherwise the exception
+ * return code will restart the "syscall" instruction and the system
+ * call will repeat forever.
+ *
+ * Since none of the OS/161 system calls have more than 4 arguments,
+ * there should be no need to fetch additional arguments from the
+ * user-level stack.
+ *
+ * Watch out: if you make system calls that have 64-bit quantities as
+ * arguments, they will get passed in pairs of registers, and not
+ * necessarily in the way you expect. We recommend you don't do it.
+ * (In fact, we recommend you don't use 64-bit quantities at all. See
+ * arch/mips/include/types.h.)
+ */
+
+//extern int numthreads;
+//int numthreads;
+int num_of_forks_taken_place = 0;
+
+void
+mips_syscall(struct trapframe *tf) {
+    int callno;
+    int32_t retval;
+    int err = 0;
+
+    assert(curspl == 0);
+
+    callno = tf->tf_v0;
+
+    /*
+     * Initialize retval to 0. Many of the system calls don't
+     * really return a value, just 0 for success and -1 on
+     * error. Since retval is the value returned on success,
+     * initialize it to 0 by default; thus it's not necessary to
+     * deal with it except for calls that return other values, 
+     * like write.
+     */
+
+    retval = 0;
+
+    switch (callno) {
+        case SYS_reboot:
+            err = sys_reboot(tf->tf_a0);
+            break;
+
+        case SYS_write:
+            err = sys_write(tf->tf_a0, (void *) tf->tf_a1, tf->tf_a2, &retval);
+            break;
+
+        case SYS_read:
+            err = sys_read(tf->tf_a0, (void *) tf->tf_a1, tf->tf_a2, &retval);
+            break;
+
+        case SYS_execv:
+            err = sys_execv((char *) tf->tf_a0, (char **) tf->tf_a1); //to check
+            break;
+            /* Add stuff here */
+
+        case SYS_waitpid:
+            err = sys_waitpid((pid_t) tf->tf_a0, (int*) tf-> tf_a1, tf->tf_a2, &retval);
+            break;
+
+        case SYS__exit:
+            sys_exit(tf->tf_a0);
+            break;
+
+        case SYS___time:
+            err = sys_time(tf->tf_a0, tf->tf_a1);
+            break;
+
+        case SYS_fork:
+            err = sys_fork(tf, &retval);
+            break;
+
+        case SYS_getpid:
+            err = sys_getpid(&retval);
+            break;
+
+        default:
+            kprintf("Unknown syscall %d\n", callno);
+            err = ENOSYS;
+            break;
+    }
+
+    if (err) {
+        /*
+         * Return the error code. This gets converted at
+         * userlevel to a return value of -1 and the error
+         * code in errno.
+         */
+        tf->tf_v0 = err;
+        tf->tf_a3 = 1; /* signal an error */
+    } else {
+        /* Success. */
+        tf->tf_v0 = retval;
+        tf->tf_a3 = 0; /* signal no error */
+    }
+
+    /*
+     * Now, advance the program counter, to avoid restarting
+     * the syscall over and over again.
+     */
+
+    tf->tf_epc += 4;
+
+    /* Make sure the syscall code didn't forget to lower spl */
+    assert(curspl == 0);
+}
+
+int
+sys_getpid(int* retval) {
+    *retval = curthread->pid;
+    return 0;
+}
+
+void
+md_forkentry(struct trapframe *tf, unsigned long child_address)
+{
+    /*
+     * This function is provided as a reminder. You need to write
+     * both it and the code that calls it.
+     *
+     * Thus, you can trash it and do things another way if you prefer.
+     */
+
+    (void)tf;
+    
+    //create a trapframe locally with the address space provided
+    struct trapframe* temporary_trapframe_for_copy = tf;
+    struct addrspace* temporary_address = (struct addrspace*) child_address;
+
+
+    //set error value and increment the stack pointer to point to next instruction
+    temporary_trapframe_for_copy->tf_v0 = 0;
+    temporary_trapframe_for_copy->tf_a3 = 0;
+    temporary_trapframe_for_copy->tf_epc += 4;
+    
+    //activate the address space
+    curthread->t_vmspace = temporary_address;
+    as_activate(temporary_address);
+
+    //free temporay trapframe and pass value into user space 
+    struct trapframe return_trapframe = *temporary_trapframe_for_copy;
+    kfree(tf);
+    tf = NULL;
+    mips_usermode(&return_trapframe);
+
+    
+}
+
+int
+sys_fork(struct trapframe *tf, int* retval){
+    
+    //set up variables
+    int error_checking = 0;
+    int error_checking2 = 0;
+    int process_ppid = curthread->pid;
+    struct addrspace *newly_assigned_address;
+    struct thread *child_thread;
+
+    //limit space for number of forks allowed
+    if (num_of_forks_taken_place > 100){
+        *retval = EAGAIN;
+        return EAGAIN;
+    }
+    else{
+        num_of_forks_taken_place ++;
+    }
+    
+    //create a new trapframe to be passed
+    struct trapframe *new_tf = (struct trapframe*) kmalloc(sizeof(struct trapframe));
+    
+    //test if trapframe creation was successful
+    if(new_tf == NULL){
+        *retval = ENOMEM;
+        kfree(new_tf);
+        return ENOMEM; 
+    }
+    
+    //check for whether copying the address space was successful for newly created process
+    error_checking2 = as_copy(curthread->t_vmspace, &newly_assigned_address);
+    if (error_checking2!=0){
+        *retval = -1;
+        kfree(new_tf);
+        return error_checking2;
+    }
+    
+    //activate the address space
+    as_activate(curthread->t_vmspace);
+    
+    //copy the value into the new trapframe
+    *new_tf = *tf;
+    
+    //check whether fork was successful based on return value from thread_fork
+    error_checking = thread_fork(curthread->t_name, (struct trapframe*) new_tf, (unsigned long) newly_assigned_address, md_forkentry, &child_thread);
+    if (error_checking!=0){
+        *retval = -1;
+        kfree(new_tf);
+        return error_checking;
+    }
+    
+    //update the process table with new process values
+    *retval = child_thread->pid;
+    process_table[child_thread->pid].ppid = process_ppid;
+    child_thread->ppid = process_table[child_thread->pid].ppid;
+    kfree(new_tf);
+    return 0;
+}
+
+int
+sys_waitpid(pid_t pid, int *status, int options, int* retval) {
+
+    if (status == NULL) {
+        return EFAULT;
+    }
+
+    if (((unsigned)status) % 4 != 0)
+        return EFAULT;
+
+    if (pid < 0)
+        return EINVAL;
+
+    if (pid == 0) {
+        *status = 0;
+        return EINVAL;
+    }
+
+    if (pid >= 149) {
+        return EINVAL;
+    }
+
+    if (options) {
+        return EINVAL;
+    }
+
+    if (status == NULL) {
+        return EFAULT;
+    }
+
+    int* errorCheck = kmalloc(sizeof (int));
+    int error = copyin(status, errorCheck, sizeof (int));
+
+    if (error != 0) {
+        kfree(errorCheck);
+        errorCheck = NULL;
+        *retval = -1;
+        return error;
+    }
+
+    kfree(errorCheck);
+    errorCheck = NULL;
+
+    if (process_table[pid].ppid != curthread->pid)//////////////////////////added
+        return EINVAL;
+
+    if ((int) pid == curthread -> pid) //if you're waiting for yourself, nono
+        return EINVAL;
+
+    if ((int) pid == curthread -> ppid) //if you're waiting for your parent, nono okay
+        return EINVAL;
+    
+    //thread doesnt exist
+    if (process_table[pid].assigned == 0 && process_table[pid].thread_ptr == NULL)
+        return EINVAL;
+
+    //check if it's being waited on
+    if (process_table[pid].being_waited_upon == 1) {
+        return EINVAL;
+    }
+
+    // if the process already exited        0 = exited     1 = not exited
+    if (process_table[pid].exited == 0) {
+        *retval = pid;
+        *status = process_table[pid].exitcode;
+        return 0;//changewd
+    }
+
+    //stop current thread (parent), switches to child
+    P(process_table[pid].waitpid_exit_sem);
+
+    //return correct status and return value once the thread that was waited on has exited
+    *status = process_table[pid].exitcode;
+    *retval = pid;
+    process_table[pid].being_waited_upon = 1;
+
+    return 0;
+}
+
+void
+sys_exit(int exitcode) {
+    //update child to exited and exitcode ------- then wake up 
+    process_table[curthread->pid].exited = 0;
+    process_table[curthread->pid].exitcode = exitcode;
+    V(process_table[curthread->pid].waitpid_exit_sem);
+    thread_exit();
+}
+
+int 
+sys_execv(char *program, char **args){
+    struct vnode *v;
+    vaddr_t entryptr, stackptr;
+    int error;
+    int number_of_arguments = 0;    
+    int i = 0;
+    int result;
+    size_t buffer_as_intermediate;
+
+    //invalid input argument
+    if (program == NULL || args == NULL) {
+        return EFAULT;
+    }
+
+    //check if enough memory
+    char* program_name = (char*)kmalloc(PATH_MAX); 
+
+    if (program_name == NULL) {
+        kfree(program_name);
+        return ENOMEM;  
+    }   
+
+    error = copyinstr((userptr_t)program,program_name,PATH_MAX,&buffer_as_intermediate);
+    if (error) {
+        kfree(program_name);
+        return error;
+    }
+
+    //program name 
+    if (strlen(program_name) == 0) {
+        kfree(program_name);
+        return EINVAL;
+    }
+        
+    //check for argument input
+    char** check_argument_double_ptr;
+    check_argument_double_ptr = (char **)kmalloc (sizeof(char*));   
+    error = copyin((userptr_t)args,check_argument_double_ptr,(sizeof(char*)));
+    if (error){
+        kfree(program_name);
+        kfree(check_argument_double_ptr);
+        return error;
+    } 
+
+    kfree(check_argument_double_ptr);
+        
+    //for each ptr in the input argument ptr address
+    char* check_argument_single_ptr;
+    i = 0;
+    for(i;1;i++){
+        error = copyin((userptr_t)&(args[i]), &check_argument_single_ptr, (sizeof(userptr_t)));
+        if (error) {
+            kfree(program_name);
+            return EFAULT;
+        }
+        
+        if (check_argument_single_ptr == NULL){
+            break;
+        }         
+    }
+    number_of_arguments = i;
+
+    char** argument_content;
+    argument_content = (char **)kmalloc (sizeof(char*)*(number_of_arguments+1));
+
+    //check if enough memory
+    if(argument_content == NULL) {
+        kfree(program_name);
+        kfree(argument_content);
+        return ENOMEM;
+    }
+
+    i = 0;
+    while (i<number_of_arguments){
+        argument_content[i] = (char*)kmalloc(sizeof(char) * PATH_MAX);
+        error = copyinstr((userptr_t)args[i], argument_content[i], PATH_MAX, &buffer_as_intermediate);
+        if (error) {                    //does kfree free recursively?????????????
+            kfree(program_name);
+            kfree(argument_content);
+            return error;
+        }
+        i++;
+    }
+        
+    argument_content[number_of_arguments] = NULL;
+
+    result = vfs_open(program_name, O_RDONLY, &v);
+    if (result) {
+        kfree(program_name);
+        kfree(argument_content);
+        return result;
+    }
+    
+    if (curthread->t_vmspace != NULL) {
+        struct addrspace *toDelete;
+        toDelete = curthread->t_vmspace;
+        curthread->t_vmspace = NULL;
+        as_destroy(toDelete);       
+    }
+
+    /* We should be a new thread. */
+    assert(curthread->t_vmspace == NULL);
+
+    /* Create a new address space. */
+    curthread->t_vmspace = as_create();
+    if (curthread->t_vmspace==NULL) {
+        vfs_close(v);
+        kfree(program_name);
+        kfree(argument_content);
+        return ENOMEM;
+    }
+
+    /* Activate it. */
+    as_activate(curthread->t_vmspace);
+
+    /* Load the executable. */
+    result = load_elf(v, &entryptr);
+    if (result) {
+        /* thread_exit destroys curthread->t_vmspace */
+        vfs_close(v);
+        kfree(program_name);
+        kfree(argument_content);
+        return result;
+    }
+
+    /* Done with the file now. */
+    vfs_close(v);
+
+    /* Define the user stack in the address space */
+    result = as_define_stack(curthread->t_vmspace, &stackptr);
+    if (result) {
+        /* thread_exit destroys curthread->t_vmspace */
+        kfree(program_name);
+        kfree(argument_content);
+        return result;
+    }
+    
+    //pushing
+    int argument_size = 0;
+    int spOffset = 0;
+    vaddr_t argument_pointer[number_of_arguments+1];
+        
+        i = number_of_arguments - 1;
+        int total_size = 0;
+        while(1){   
+            if (i < 0){
+                break;
+            }
+            else{
+                //store onto stack, making sure everything is aligned properly
+                argument_size = strlen(argument_content[i]) + 1;
+                spOffset = (argument_size + 3)/4;
+                stackptr -= spOffset*4;
+                error = copyoutstr(argument_content[i], (userptr_t)stackptr, argument_size, &buffer_as_intermediate);
+                if (error) {
+                    kfree(program_name);
+                    kfree(argument_content);
+                    return error;
+                }
+                argument_pointer[i] = stackptr;
+                i = i - 1;
+                total_size += argument_size;
+                if (total_size > PATH_MAX) {
+                    kfree(program_name);
+                    kfree(argument_content);
+                    return E2BIG;
+                }
+            }
+    }
+        
+    //last element as NULL
+    argument_pointer[number_of_arguments] = NULL;
+
+    //restore sp
+    i = number_of_arguments;
+    while(1){
+        if (i < 0){
+            break;
+        }
+        stackptr -= sizeof(void*);
+        error = copyout(&argument_pointer[i], (userptr_t)stackptr, sizeof(argument_pointer[i]));
+        if (error) {
+            kfree(program_name);
+            kfree(argument_content);
+            return error;
+        }
+        i = i - 1;
+    }
+
+    //clean up
+    kfree(program_name);
+    kfree(argument_content);
+
+    /* Warp to user mode. */
+    md_usermode(number_of_arguments, (userptr_t)stackptr, stackptr, entryptr);
+    
+    /* md_usermode does not return */
+    panic("md_usermode returned\n");
+    return EINVAL;
+}
+
+int sys_write(int fd, const void *buf, size_t nbytes, int* retval){
+
+    //if no in write or not in error printing mode
+    if (fd!=1 && fd!=2){
+        *retval = -1; 
+        return EBADF;
+
+    }
+    
+    //check for invalid input and over bound access
+    if (buf == NULL || buf == (char *)0xbadbeef || buf == (char *)0x0 || buf == (char *)0xdeadbeef || (buf) > (char *)0x80000000){
+        *retval = -1; 
+        return EFAULT;
+    }
+    int result;
+    struct vnode *v;
+    struct uio u;
+    
+    //set up writing
+    char *console = NULL;
+    console = kstrdup("con:");
+    result = vfs_open(console, 1, &v);
+    kfree(console);
+    
+    //specifies writing to user space
+    u.uio_iovec.iov_ubase = (userptr_t)buf;
+    u.uio_iovec.iov_len = nbytes;
+    u.uio_offset = 0;
+    u.uio_resid = nbytes;
+    u.uio_segflg = UIO_USERSPACE;
+    u.uio_rw = UIO_WRITE;
+    u.uio_space = curthread->t_vmspace;
+    result = VOP_WRITE(v, &u);
+    
+    //check if successful
+    if (result){
+        *retval = result;
+        return -1;
+    }
+    else{
+        *retval = nbytes;
+        return 0;  
+    }
+}
+
+int sys_read(int fd, void *buf, size_t buflen, int* retval){
+    //if not in read mode
+    if (fd != 0) {
+        *retval = -1;
+        return EBADF;
+    }
+    
+    //check for invalid input and over bound access
+    if (buf == NULL || buf == (char *)0xbadbeef || buf == (char *)0x0 || buf == (char *)0xdeadbeef || (buf) > (char *)0x80000000){
+        *retval = -1;
+        return EFAULT;
+    }
+    int result;
+    struct vnode *v;
+    struct uio u;
+    
+    //set up reading
+    char *console = NULL;
+    console = kstrdup("con:");
+    result = vfs_open(console, 0, &v);
+    kfree(console);
+    
+    //specifies writing to kernel
+    u.uio_iovec.iov_kbase = buf; 
+    u.uio_iovec.iov_len = buflen;
+    u.uio_offset = 0;
+    u.uio_resid = buflen;
+    u.uio_segflg = UIO_SYSSPACE;
+    u.uio_rw = UIO_READ; 
+    u.uio_space = NULL;
+    result = VOP_READ(v, &u);
+    
+    //check if successful
+    if (result){
+        *retval = result;
+        return -1;
+    }
+    else{
+        *retval = buflen;
+        return 0;
+    }
+}
+
+//The current time (in seconds and nanoseconds since midnight GMT on January 1, 1970) is retrieved. If seconds and/or nanoseconds are non-null, 
+//the corresponding components of the time are stored through those pointers. The time in seconds is also returned.
+time_t sys_time(time_t *seconds, unsigned long *nanoseconds) {
+    time_t tsec;
+    unsigned long tnanosec;
+
+    gettime(&tsec, &tnanosec);          //from clock.h
+    int result = 0;
+
+    if (seconds != NULL && nanoseconds != NULL) {           //both are non null
+        result = copyout(&tsec, seconds, sizeof(tsec));
+        if (result)
+            return EFAULT;
+
+        result = copyout(&tnanosec, nanoseconds, sizeof(tnanosec));
+        if (result)
+            return EFAULT;
+    } else if (seconds != NULL) {                           //only second is non null
+        result = copyout(&tsec, seconds, sizeof(tsec));
+        if (result)
+            return EFAULT;
+    } else if (nanoseconds != NULL) {                       //only nano is non null
+        result = copyout(&tnanosec, nanoseconds, sizeof(tnanosec));
+        if (result)
+            return EFAULT;
+    }
+
+    return tsec;
+}
